@@ -6,19 +6,15 @@ without writing temporary files to disk.
 """
 
 import os
-
-# Disable XLA auto-compilation. TensorFlow's JIT compiler triggers on the
-# first real prediction and causes a large one-time memory spike, which
-# reliably crashes the process on memory-constrained hosts like Render's
-# free tier (512 MB). This model is small enough that XLA's speedup isn't
-# worth that risk. This must be set BEFORE tensorflow is imported.
-os.environ.setdefault("TF_XLA_FLAGS", "--tf_xla_auto_jit=0")
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
-
 import numpy as np
 import cv2
 from PIL import Image
-import tensorflow as tf
+
+# TFLite interpreter only -- NOT full TensorFlow. Importing full TensorFlow
+# costs ~620 MB by itself before a model is even loaded, which alone exceeds
+# Render's free-tier 512 MB limit and crashes the process. The TFLite runtime
+# does the same inference for ~35 MB, an ~18x reduction.
+from ai_edge_litert.interpreter import Interpreter
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -33,7 +29,7 @@ UNCERTAIN_MESSAGE = (
     "expert before acting on this result."
 )
 
-MODEL_PATH = os.path.join(os.path.dirname(__file__), "model", "mango_model.keras")
+MODEL_PATH = os.path.join(os.path.dirname(__file__), "model", "mango_model.tflite")
 CLASS_NAMES_PATH = os.path.join(os.path.dirname(__file__), "model", "class_names.txt")
 
 DEFAULT_CLASS_NAMES = [
@@ -229,20 +225,25 @@ def load_class_names():
 
 CLASS_NAMES = load_class_names()
 
-_model = None
+_interpreter = None
+_input_details = None
+_output_details = None
 
 
 def load_model():
-    """Load (and cache) the trained Keras model."""
-    global _model
-    if _model is None:
+    """Load (and cache) the TFLite interpreter."""
+    global _interpreter, _input_details, _output_details
+    if _interpreter is None:
         if not os.path.exists(MODEL_PATH):
             raise FileNotFoundError(
                 f"Model file not found at {MODEL_PATH}. "
-                "Make sure model/mango_model.keras is committed (via Git LFS)."
+                "Make sure model/mango_model.tflite is committed to the repo."
             )
-        _model = tf.keras.models.load_model(MODEL_PATH)
-    return _model
+        _interpreter = Interpreter(model_path=MODEL_PATH)
+        _interpreter.allocate_tensors()
+        _input_details = _interpreter.get_input_details()[0]
+        _output_details = _interpreter.get_output_details()[0]
+    return _interpreter
 
 
 def to_pil(image):
@@ -317,13 +318,15 @@ def predict_disease(image):
     if pil is None:
         raise ValueError("No image provided.")
 
-    model = load_model()
+    load_model()  # ensures the interpreter is loaded and cached
 
     resized = pil.resize(IMG_SIZE)
-    arr = tf.keras.preprocessing.image.img_to_array(resized)
+    arr = np.asarray(resized, dtype=np.float32)
     arr = np.expand_dims(arr, axis=0)
 
-    scores = model.predict(arr, verbose=0)[0]
+    _interpreter.set_tensor(_input_details["index"], arr)
+    _interpreter.invoke()
+    scores = _interpreter.get_tensor(_output_details["index"])[0]
 
     top_predictions = get_top_k_predictions(scores, TOP_K)
     predicted_index = int(np.argmax(scores))
