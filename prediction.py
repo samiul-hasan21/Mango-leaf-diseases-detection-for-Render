@@ -6,6 +6,15 @@ without writing temporary files to disk.
 """
 
 import os
+
+# Disable XLA auto-compilation. TensorFlow's JIT compiler triggers on the
+# first real prediction and causes a large one-time memory spike, which
+# reliably crashes the process on memory-constrained hosts like Render's
+# free tier (512 MB). This model is small enough that XLA's speedup isn't
+# worth that risk. This must be set BEFORE tensorflow is imported.
+os.environ.setdefault("TF_XLA_FLAGS", "--tf_xla_auto_jit=0")
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+
 import numpy as np
 import cv2
 from PIL import Image
